@@ -1,0 +1,11 @@
+{
+  "cores": 10,
+  "partitions": 40,
+  "supports": [
+    0.03,
+    0.025,
+    0.02
+  ],
+  "total_baskets": 18338,
+  "input_dataset": null
+}
