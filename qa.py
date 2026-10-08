@@ -100,6 +100,10 @@ def create_spark_session(cores):
 
 
 def load_dataset(input_path=None, dataset_id=352):
+    """
+    Load the Online Retail dataset from a local file or fetch it from UCI ML Repository.
+    """
+    # Load dataset from a local file if a path is provided
     if input_path is not None:
         print(f"Loading dataset from: {input_path}")
 
@@ -113,8 +117,8 @@ def load_dataset(input_path=None, dataset_id=352):
             )
 
     else:
+        # load from UCI ML Repository using ucimlrepo
         print(f"Fetching UCI dataset {dataset_id}...")
-
         try:
             from ucimlrepo import fetch_ucirepo
         except ImportError as exc:
@@ -142,17 +146,22 @@ def load_dataset(input_path=None, dataset_id=352):
 
     return pdf
 
+
 def prepare_quantity_aware_baskets(spark, pdf):
+    """Prepare transactions while keeping item quantities."""
+
     print("Preparing quantity-aware transaction baskets...")
 
     for column in ["InvoiceNo", "StockCode", "Description", "CustomerID"]:
         if column in pdf.columns:
             pdf[column] = pdf[column].astype(str)
 
+    # Convert the Pandas DataFrame to a Spark DataFrame
     df = spark.createDataFrame(pdf)
 
     total_raw_records = df.count()
 
+    # Clean the dataset by filtering out invalid records
     df_cleaned = (
         df.filter(~F.col("InvoiceNo").rlike("^[Cc]"))
           .filter(F.col("Quantity") > 0)
@@ -161,6 +170,7 @@ def prepare_quantity_aware_baskets(spark, pdf):
 
     valid_records = df_cleaned.count()
 
+    # Build a mapping from stock codes to item descriptions
     item_dict_rows = (
         df_cleaned
         .select("StockCode", "Description")
@@ -173,12 +183,14 @@ def prepare_quantity_aware_baskets(spark, pdf):
         for row in item_dict_rows
     }
 
+    # Sum quantities for each item within each invoice
     df_grouped = (
         df_cleaned
         .groupBy("InvoiceNo", "StockCode")
         .agg(F.sum("Quantity").alias("Quantity"))
     )
 
+    # Create baskets containing items and their quantities
     baskets_df = (
         df_grouped
         .groupBy("InvoiceNo")
@@ -186,7 +198,7 @@ def prepare_quantity_aware_baskets(spark, pdf):
             F.collect_list("StockCode").alias("items"),
             F.collect_list("Quantity").alias("quantities")
         )
-        .filter(F.size(F.col("items")) > 1)
+        .filter(F.size(F.col("items")) > 1) # Keep only baskets containing more than one item
     )
 
     baskets_df.cache()
@@ -199,6 +211,7 @@ def prepare_quantity_aware_baskets(spark, pdf):
 
     local_baskets = []
 
+    # Convert Spark baskets into local dictionaries
     for row in baskets_df.collect():
         basket = {
             item: float(quantity)
@@ -212,6 +225,10 @@ def prepare_quantity_aware_baskets(spark, pdf):
 
     return local_baskets, item_dict
 
+
+
+
+# QA - APRIORI
 
 def generate_candidates(prev_frequent_itemsets, k):
     candidates = set()
@@ -237,17 +254,10 @@ def generate_candidates(prev_frequent_itemsets, k):
     return candidates
 
 
-def distributed_apriori_qa(
-    spark,
-    baskets_rdd,
-    total_baskets,
-    min_support_ratio
-):
+def distributed_apriori_qa(spark, baskets_rdd, total_baskets, min_support_ratio):
     start_time = time.time()
 
-    min_support_count = int(
-        total_baskets * min_support_ratio
-    )
+    min_support_count = int(total_baskets * min_support_ratio)
 
     all_frequent_itemsets = {}
     level_stats = {}
@@ -261,31 +271,43 @@ def distributed_apriori_qa(
 
     level_start = time.time()
 
+    
     def map_l1(basket):
+        """
+        For each item in the basket, creates a 1-item candidate with its transaction count, 
+        log-scaled quantity, and original quantity, which are used to calculate its weighted support.
+        """
+        # Create a weighted 1-item candidate for each item in the basket
         for item, quantity in basket.items():
             yield (
-                frozenset([item]),
+                frozenset([item]),  # Represent the item as a 1-item set
                 (
-                    1,
-                    math.log1p(quantity),
-                    quantity
+                    1,                  # Number of transactions containing the item
+                    math.log1p(quantity), # Log-scaled quantity
+                    quantity             # Original quantity
                 )
             )
 
+
+
+
+
     l1_rdd = (
         baskets_rdd
-        .flatMap(map_l1)
+        .flatMap(map_l1) # Generate one 1-item candidate for each item in every basket
         .reduceByKey(
             lambda a, b: (
-                a[0] + b[0],
-                a[1] + b[1],
-                max(a[2], b[2])
+                a[0] + b[0], # Sum the number of transactions
+                a[1] + b[1], # Sum the log-scaled quantities
+                max(a[2], b[2]) # Keep the maximum original quantity
             )
-        )
+        ) # Combine candidates with the same item across all baskets
     )
 
     total_unique_items = l1_rdd.count()
 
+    # filter out candidates that do not meet the minimum support count
+    # and collect the remaining frequent 1-item candidates into a dictionary
     current_frequent = dict(
         l1_rdd
         .filter(
@@ -302,6 +324,7 @@ def distributed_apriori_qa(
         "time": time.time() - level_start
     }
 
+    # Unpersist the RDD to free up memory
     l1_rdd.unpersist()
 
     k = 2
@@ -309,6 +332,7 @@ def distributed_apriori_qa(
     while current_frequent:
         level_start = time.time()
 
+        # generate the candidates
         candidates = generate_candidates(
             current_frequent,
             k
@@ -317,15 +341,22 @@ def distributed_apriori_qa(
         if not candidates:
             break
 
+        # broadcast the candidates to all nodes
         broadcast_candidates = (
             spark.sparkContext.broadcast(candidates)
         )
 
         def map_candidates(basket):
+            """ 
+            Map a basket to its frequent itemsets. 
+            """
             basket_items = set(basket.keys())
 
             for candidate in broadcast_candidates.value:
                 if candidate.issubset(basket_items):
+                    # select the minimum quantity among the items in the candidate
+                    # The minimum quantity is used because the joint purchase volume of an itemset is
+                    # limited by the item purchased in the smallest quantity
                     volume = min(
                         basket[item]
                         for item in candidate
@@ -340,19 +371,20 @@ def distributed_apriori_qa(
                         )
                     )
 
+        # Count the support for each candidate across all baskets
         counts_rdd = (
             baskets_rdd
-            .flatMap(map_candidates)
+            .flatMap(map_candidates) # map a basket to its frequent itemsets
             .reduceByKey(
                 lambda a, b: (
                     a[0] + b[0],
                     a[1] + b[1],
                     max(a[2], b[2])
                 )
-            )
+            )  # Combine candidates with the same itemset across all baskets
             .filter(
                 lambda x: x[1][0] >= min_support_count
-            )
+            ) # filter out candidates that do not meet the minimum support count
         )
 
         current_frequent = dict(
@@ -385,7 +417,11 @@ def distributed_apriori_qa(
     return all_frequent_itemsets, statistics
 
 
+
+# QA - SON
+
 def local_apriori(baskets_partition, local_min_support):
+    """Used in the SON algorithm to find local frequent itemsets within a partition."""
     item_counts = defaultdict(int)
 
     for basket in baskets_partition:
@@ -418,23 +454,21 @@ def local_apriori(baskets_partition, local_min_support):
                     previous[i] | previous[j]
                 )
 
+                # consider only candidates of size k
                 if len(union_set) != k:
                     continue
 
                 valid = True
-
+                # check if all (k-1)-subsets of the candidate are frequent
                 for subset in itertools.combinations(
                     union_set,
                     k - 1
                 ):
-                    if (
-                        frozenset(subset)
-                        not in current_frequent
-                    ):
+                    if frozenset(subset) not in current_frequent:
                         valid = False
-                        break
+                        break # if not all subsets are frequent, skip this candidate
 
-                if valid:
+                if valid: # if all (k-1)-subsets are frequent, add the candidate to the set
                     candidates.add(union_set)
 
         if not candidates:
@@ -458,7 +492,7 @@ def local_apriori(baskets_partition, local_min_support):
             for candidate, count
             in candidate_counts.items()
             if count >= local_min_support
-        }
+        }   # filter out candidates that do not meet the local minimum support
 
         all_local_frequent.extend(
             current_frequent.keys()
@@ -491,6 +525,9 @@ def quantity_aware_son(
     phase1_start = time.time()
 
     def phase1_mapper(partition_iterator):
+        """
+        Map each partition to its local frequent itemsets using the local Apriori algorithm.
+        """
         partition = list(partition_iterator)
 
         if not partition:
@@ -510,8 +547,8 @@ def quantity_aware_son(
 
     candidate_rdd = (
         baskets_rdd
-        .mapPartitions(phase1_mapper)
-        .distinct()
+        .mapPartitions(phase1_mapper)   # map each partition to its local frequent itemsets
+        .distinct() # remove duplicate candidates across partitions
     )
 
     global_candidates = candidate_rdd.collect()
@@ -527,6 +564,7 @@ def quantity_aware_son(
 
     phase2_start = time.time()
 
+    # broadcast the global candidates to all nodes for phase 2
     broadcast_candidates = (
         spark.sparkContext.broadcast(
             global_candidates
